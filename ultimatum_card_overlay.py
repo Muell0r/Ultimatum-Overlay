@@ -108,29 +108,36 @@ def line_color(text, classes):
     return "#e6e0d2"
 
 
+def _norm(x):
+    return " ".join(str(x).split())          # also turns non-breaking spaces into normal ones
+
+
 def parse_poedb(html):
     """Read the card list from the poedb.tw page (section 'Divination Cards Item')."""
-    from bs4 import BeautifulSoup
+    from bs4 import BeautifulSoup, Comment
     soup = BeautifulSoup(html, "html.parser")
-    heading = None
-    for tag in soup.find_all(["h2", "h3", "h4", "h5", "h6"]):
-        if tag.get_text(" ", strip=True).startswith("Divination Cards Item"):
-            heading = tag
+    start = None
+    for s in soup.find_all(string=re.compile(r"Divination\s+Cards\s+Item")):
+        if s.find_parent(["a", "nav", "script", "style", "title"]) is None:
+            start = s
             break
-    if heading is None:
+    if start is None:
+        print("[info] section 'Divination Cards Item' not found on the page")
         return {}
     raw = {}
     cur = None
-    for node in heading.find_all_next(string=True):
-        text = " ".join(str(node).split())
+    for node in start.find_all_next(string=True):
+        if isinstance(node, Comment) or node.find_parent(["script", "style"]) is not None:
+            continue
+        text = _norm(node)
         if not text:
             continue
-        if text.startswith("Divination Cards Atlas Tree"):
+        if re.match(r"(Divination Cards Atlas Tree|Disabled Item|Areas /)", text):
             break
-        parent = node.parent
-        href = parent.get("href", "") if parent is not None and parent.name == "a" else ""
-        if href and re.match(r"^(https://poedb\.tw)?/us/[^#?]+$", href):
-            cur = raw.setdefault(text, [])
+        a = node.find_parent("a")
+        href = a.get("href", "") if a is not None else ""
+        if a is not None and href and not href.startswith(("#", "javascript")):
+            cur = raw.setdefault(text, [])       # a link with text = a card name
             continue
         if cur is not None:
             cls = " ".join(" ".join(p.get("class", [])) for p in list(node.parents)[:3])
@@ -170,7 +177,14 @@ def load_cards():
                     json.dump(data, f, ensure_ascii=False)
             else:
                 print("[warn] too few cards found, the page layout may have changed.")
-                print("       start of the page:", r.text[:300].replace("\n", " "))
+                for key in ("Three_Faces_in_the_Dark", "The_Doctor", "Divination Cards Item"):
+                    i = r.text.find(key)
+                    if i >= 0:
+                        print("       page code around the first card:")
+                        print("       " + r.text[max(0, i - 400): i + 800].replace("\n", " "))
+                        break
+                else:
+                    print("       start of the page:", r.text[:300].replace("\n", " "))
         except Exception as e:
             print(f"[warn] could not download card data: {e}")
     if os.path.exists(CARDS_JSON):
