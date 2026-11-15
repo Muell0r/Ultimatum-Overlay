@@ -86,25 +86,91 @@ def safe(name):
 cards = {}   # card name -> {"name", "stack", "reward", "flavour", "icon"}
 
 
-def fetch_cards():
-    """Cards are identical in every league, so Standard is used as the source."""
-    r = requests.get(
-        NINJA_URL,
-        params={"league": "Standard", "type": "DivinationCard"},
-        headers=HEADERS,
-        timeout=20,
-    )
+API = "https://poe.ninja"
+
+
+def api_get(path, **params):
+    r = requests.get(API + path, params=params, headers=HEADERS, timeout=20)
     r.raise_for_status()
+    return r.json()
+
+
+def _entry(name, stack=None, mods=None, flavour=None, icon=None):
+    reward = ""
+    if mods and isinstance(mods, list) and isinstance(mods[0], dict):
+        reward = mods[0].get("text", "") or ""
+    return {"name": name, "stack": stack, "reward": reward,
+            "flavour": flavour or "", "icon": icon}
+
+
+def parse_lines(data):
+    """poe.ninja item overview: lines[] with name, stackSize, explicitModifiers, ..."""
     out = {}
-    for line in r.json().get("lines", []):
-        mods = line.get("explicitModifiers") or [{}]
-        out[line["name"]] = {
-            "name": line["name"],
-            "stack": line.get("stackSize"),
-            "reward": mods[0].get("text", ""),
-            "flavour": line.get("flavourText", "") or "",
-            "icon": line.get("icon"),
-        }
+    lines = data.get("lines") if isinstance(data, dict) else None
+    for line in lines or []:
+        if isinstance(line, dict) and line.get("name"):
+            out[line["name"]] = _entry(line["name"], line.get("stackSize"),
+                                       line.get("explicitModifiers"),
+                                       line.get("flavourText"), line.get("icon"))
+    return out
+
+
+def parse_core_items(data):
+    """poe.ninja exchange overview: item names and icons are listed in core.items"""
+    out = {}
+    core = data.get("core") if isinstance(data, dict) else None
+    items = core.get("items") if isinstance(core, dict) else None
+    if isinstance(items, dict):
+        items = list(items.values())
+    for it in items or []:
+        if not isinstance(it, dict) or not it.get("name"):
+            continue
+        icon = it.get("icon") or it.get("image")
+        if icon and not str(icon).startswith("http"):
+            icon = "https://web.poecdn.com/" + str(icon).lstrip("/")
+        out[it["name"]] = _entry(it["name"], it.get("stackSize"),
+                                 it.get("explicitModifiers"), it.get("flavourText"), icon)
+    return out
+
+
+def merge(into, new):
+    for name, c in new.items():
+        cur = into.setdefault(name, _entry(name))
+        for k, v in c.items():
+            if v and not cur.get(k):
+                cur[k] = v
+
+
+def fetch_cards():
+    """Cards are identical in every league, so any league works as the source."""
+    ids = []
+    try:
+        for lg in api_get("/poe1/api/economy/leagues"):
+            ids.append(lg.get("id") or lg.get("name"))
+    except Exception as e:
+        print(f"[info] league list not available: {e}")
+    ids.append("Standard")
+    ids = [i for n, i in enumerate(ids) if i and i not in ids[:n]]
+    attempts = [
+        ("/poe1/api/economy/stash/current/item/overview", parse_lines),
+        ("/poe1/api/economy/exchange/current/overview", parse_core_items),
+        ("/api/data/itemoverview", parse_lines),
+    ]
+    out = {}
+    for league in ids:
+        for path, parser in attempts:
+            try:
+                data = api_get(path, league=league, type="DivinationCard")
+            except Exception as e:
+                print(f"[info] {path} (league {league}): {e}")
+                continue
+            got = parser(data)
+            print(f"[info] {path} (league {league}): {len(got)} cards")
+            if not got:
+                print("       sample:", json.dumps(data)[:600])
+            merge(out, got)
+        if out:
+            break
     return out
 
 
