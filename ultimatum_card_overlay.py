@@ -1,17 +1,18 @@
 """
 Inscribed Ultimatum -> Divination Card overlay for Path of Exile 1  (screen reading)
 
-Hover an Inscribed Ultimatum, stop the mouse for a moment, and a pop-up with the
-card it asks you to sacrifice appears next to the tooltip. Move the mouse and it
+Hover an Inscribed Ultimatum, keep the mouse still for a moment, and a card pop-up
+(name, stack size, reward) appears next to the tooltip. Move the mouse and it
 disappears. Press F8 to force a scan.
 
 The tool only takes a screenshot around the mouse cursor and reads the text with
 OCR. It never touches the game client or its memory.
 
-Card data and art are downloaded once on the first start (needs internet) and are
-then stored in the folder "card_data" next to this file.
+Card data (names, stack sizes, rewards) is downloaded once from poedb.tw on the
+first start (internet needed) and stored in the folder "card_data" next to this
+file. Delete cards.json in that folder to force a fresh download.
 
-Want your own full card pictures (like a screenshot of the real card)?
+Want your own full card pictures (e.g. screenshots of the real cards)?
 Put them in the folder "card_images" and name them after the card, e.g.
     card_images\\The Fox in the Brambles.png
 Those pictures are shown instead of the built-in card layout.
@@ -20,7 +21,6 @@ Run in windowed or borderless windowed mode (an overlay can't draw over exclusiv
 """
 
 import ctypes
-import io
 import json
 import os
 import queue
@@ -58,8 +58,12 @@ MATCH_CUTOFF = 85         # 0-100, how close the OCR text must be to a real card
 TOOLTIP_HALF_WIDTH = 300  # pop-up is placed this far from the tooltip's centre
 MAX_SECONDS = 60          # safety: pop-up never stays longer than this
 
-NINJA_URL = "https://poe.ninja/api/data/itemoverview"
-HEADERS = {"User-Agent": "ultimatum-card-overlay/2.0"}
+POEDB_URL = "https://poedb.tw/us/Divination_Cards"
+HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
+    "Accept-Language": "en",
+}
 BG = "#0d0b09"
 
 # ------------------------------------------------------------------ paths
@@ -71,10 +75,9 @@ def base_dir():
 
 BASE = base_dir()
 DATA_DIR = os.path.join(BASE, "card_data")
-IMG_DIR = os.path.join(DATA_DIR, "img")
 OWN_DIR = os.path.join(BASE, "card_images")
 CARDS_JSON = os.path.join(DATA_DIR, "cards.json")
-for _d in (IMG_DIR, OWN_DIR):
+for _d in (DATA_DIR, OWN_DIR):
     os.makedirs(_d, exist_ok=True)
 
 
@@ -83,94 +86,73 @@ def safe(name):
 
 
 # ------------------------------------------------------------------ card data
-cards = {}   # card name -> {"name", "stack", "reward", "flavour", "icon"}
+cards = {}   # card name -> {"name", "stack", "lines": [[text, color], ...]}
 
 
-API = "https://poe.ninja"
+def line_color(text, classes):
+    t, c = text.lower(), classes.lower()
+    if "corrupt" in t:
+        return "#d20000"
+    if t == "disabled":
+        return "#7a7a7a"
+    if "unique" in c:
+        return "#af6025"
+    if "currency" in c:
+        return "#aa9e82"
+    if "gem" in c or re.search(r"\bgem\b", t):
+        return "#1ba29b"
+    if "magic" in c:
+        return "#8888ff"
+    if "rare" in c:
+        return "#ffff77"
+    return "#e6e0d2"
 
 
-def api_get(path, **params):
-    r = requests.get(API + path, params=params, headers=HEADERS, timeout=20)
-    r.raise_for_status()
-    return r.json()
-
-
-def _entry(name, stack=None, mods=None, flavour=None, icon=None):
-    reward = ""
-    if mods and isinstance(mods, list) and isinstance(mods[0], dict):
-        reward = mods[0].get("text", "") or ""
-    return {"name": name, "stack": stack, "reward": reward,
-            "flavour": flavour or "", "icon": icon}
-
-
-def parse_lines(data):
-    """poe.ninja item overview: lines[] with name, stackSize, explicitModifiers, ..."""
-    out = {}
-    lines = data.get("lines") if isinstance(data, dict) else None
-    for line in lines or []:
-        if isinstance(line, dict) and line.get("name"):
-            out[line["name"]] = _entry(line["name"], line.get("stackSize"),
-                                       line.get("explicitModifiers"),
-                                       line.get("flavourText"), line.get("icon"))
-    return out
-
-
-def parse_core_items(data):
-    """poe.ninja exchange overview: item names and icons are listed in core.items"""
-    out = {}
-    core = data.get("core") if isinstance(data, dict) else None
-    items = core.get("items") if isinstance(core, dict) else None
-    if isinstance(items, dict):
-        items = list(items.values())
-    for it in items or []:
-        if not isinstance(it, dict) or not it.get("name"):
-            continue
-        icon = it.get("icon") or it.get("image")
-        if icon and not str(icon).startswith("http"):
-            icon = "https://web.poecdn.com/" + str(icon).lstrip("/")
-        out[it["name"]] = _entry(it["name"], it.get("stackSize"),
-                                 it.get("explicitModifiers"), it.get("flavourText"), icon)
-    return out
-
-
-def merge(into, new):
-    for name, c in new.items():
-        cur = into.setdefault(name, _entry(name))
-        for k, v in c.items():
-            if v and not cur.get(k):
-                cur[k] = v
-
-
-def fetch_cards():
-    """Cards are identical in every league, so any league works as the source."""
-    ids = []
-    try:
-        for lg in api_get("/poe1/api/economy/leagues"):
-            ids.append(lg.get("id") or lg.get("name"))
-    except Exception as e:
-        print(f"[info] league list not available: {e}")
-    ids.append("Standard")
-    ids = [i for n, i in enumerate(ids) if i and i not in ids[:n]]
-    attempts = [
-        ("/poe1/api/economy/stash/current/item/overview", parse_lines),
-        ("/poe1/api/economy/exchange/current/overview", parse_core_items),
-        ("/api/data/itemoverview", parse_lines),
-    ]
-    out = {}
-    for league in ids:
-        for path, parser in attempts:
-            try:
-                data = api_get(path, league=league, type="DivinationCard")
-            except Exception as e:
-                print(f"[info] {path} (league {league}): {e}")
-                continue
-            got = parser(data)
-            print(f"[info] {path} (league {league}): {len(got)} cards")
-            if not got:
-                print("       sample:", json.dumps(data)[:600])
-            merge(out, got)
-        if out:
+def parse_poedb(html):
+    """Read the card list from the poedb.tw page (section 'Divination Cards Item')."""
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(html, "html.parser")
+    heading = None
+    for tag in soup.find_all(["h2", "h3", "h4", "h5", "h6"]):
+        if tag.get_text(" ", strip=True).startswith("Divination Cards Item"):
+            heading = tag
             break
+    if heading is None:
+        return {}
+    raw = {}
+    cur = None
+    for node in heading.find_all_next(string=True):
+        text = " ".join(str(node).split())
+        if not text:
+            continue
+        if text.startswith("Divination Cards Atlas Tree"):
+            break
+        parent = node.parent
+        href = parent.get("href", "") if parent is not None and parent.name == "a" else ""
+        if href and re.match(r"^(https://poedb\.tw)?/us/[^#?]+$", href):
+            cur = raw.setdefault(text, [])
+            continue
+        if cur is not None:
+            cls = " ".join(" ".join(p.get("class", [])) for p in list(node.parents)[:3])
+            cur.append((text, cls))
+    out = {}
+    for name, strings in raw.items():
+        stack, lines, i = None, [], 0
+        while i < len(strings):
+            s, cls = strings[i]
+            if s.lower().startswith("stack size"):
+                buf, j = s, i
+                while not re.search(r"\d+\s*/\s*\d+", buf) and j + 1 < len(strings) and j - i < 3:
+                    j += 1
+                    buf += " " + strings[j][0]
+                m = re.search(r"\d+\s*/\s*([\d,]+)", buf)
+                if m:
+                    stack = m.group(1)
+                i = j + 1
+                continue
+            lines.append([s, line_color(s, cls)])
+            i += 1
+        out[name] = {"name": name, "stack": stack, "lines": lines}
     return out
 
 
@@ -179,11 +161,16 @@ def load_cards():
     stale = exists and (time.time() - os.path.getmtime(CARDS_JSON)) > 14 * 86400
     if not exists or stale:
         try:
-            data = fetch_cards()
-            if data:
+            r = requests.get(POEDB_URL, headers=HEADERS, timeout=30)
+            r.raise_for_status()
+            data = parse_poedb(r.text)
+            print(f"[info] poedb.tw: {len(data)} cards found")
+            if len(data) >= 100:
                 with open(CARDS_JSON, "w", encoding="utf-8") as f:
                     json.dump(data, f, ensure_ascii=False)
-                print(f"[ok] downloaded data for {len(data)} cards")
+            else:
+                print("[warn] too few cards found, the page layout may have changed.")
+                print("       start of the page:", r.text[:300].replace("\n", " "))
         except Exception as e:
             print(f"[warn] could not download card data: {e}")
     if os.path.exists(CARDS_JSON):
@@ -205,60 +192,16 @@ def find_own_image(name):
     return None
 
 
-def cached_icon(card):
-    path = os.path.join(IMG_DIR, safe(card["name"]) + ".png")
-    if os.path.exists(path):
-        return path
-    if not card.get("icon"):
+def get_own_image(card):
+    path = find_own_image(card["name"])
+    if not path:
         return None
     try:
-        data = requests.get(card["icon"], headers=HEADERS, timeout=15).content
-        Image.open(io.BytesIO(data)).convert("RGBA").save(path)
-        return path
+        img = Image.open(path).convert("RGBA")
+        img.thumbnail((500, 780))
+        return img
     except Exception:
         return None
-
-
-def get_card_image(card):
-    """Returns (PIL image or None, is_own_image)."""
-    own = find_own_image(card["name"])
-    if own:
-        try:
-            img = Image.open(own).convert("RGBA")
-            img.thumbnail((500, 780))
-            return img, True
-        except Exception:
-            pass
-    path = cached_icon(card)
-    if path:
-        try:
-            return Image.open(path).convert("RGBA"), False
-        except Exception:
-            pass
-    return None, False
-
-
-def prefetch_images():
-    """Download all card art in the background so later lookups work offline."""
-    for card in list(cards.values()):
-        cached_icon(card)
-        time.sleep(0.03)
-    print("[ok] card art cached")
-
-
-TAG_COLORS = {
-    "uniqueitem": "#af6025", "rareitem": "#ffff77", "magicitem": "#8888ff",
-    "normal": "#c8c8c8", "currencyitem": "#aa9e82", "gemitem": "#1ba29b",
-    "corrupted": "#d20000", "default": "#c8c8c8", "enchanted": "#b4b4ff",
-}
-
-
-def parse_reward(markup):
-    parts = re.findall(r"<(\w+)>\{(.*?)\}", markup or "", re.S)
-    if parts:
-        return [(TAG_COLORS.get(tag, "#c8c8c8"), txt.strip()) for tag, txt in parts]
-    plain = re.sub(r"<[^>]+>|[{}]", "", markup or "").strip()
-    return [("#c8c8c8", plain)] if plain else []
 
 
 # ------------------------------------------------------------------ OCR
@@ -365,8 +308,7 @@ def scan(pos, forced=False):
         return
     card, amount, tip_cx = found
     print(f"[hit] {card['name']} (x{amount})")
-    img_card, own = get_card_image(card)
-    jobs.put(("card", card, amount, img_card, own, pos, tip_cx))
+    jobs.put(("card", card, amount, get_own_image(card), pos, tip_cx))
 
 
 def watcher():
@@ -436,7 +378,7 @@ def show_popup(build, cursor, tip_cx):
     win.attributes("-topmost", True)
     win.attributes("-alpha", 0.97)
     win.configure(bg="#c9a55c")
-    frame = tk.Frame(win, bg=BG, padx=12, pady=10)
+    frame = tk.Frame(win, bg=BG, padx=16, pady=12)
     frame.pack(padx=2, pady=2)
     build(frame)
     win.update_idletasks()
@@ -457,27 +399,25 @@ def show_popup(build, cursor, tip_cx):
     hide_job = root.after(MAX_SECONDS * 1000, close_popup)
 
 
-def build_card(f, card, amount, img, own):
+def build_card(f, card, amount, img):
     global photo_ref
-    if own and img is not None:                    # your own full card picture, shown as is
+    if img is not None:                            # your own full card picture, shown as is
         photo_ref = ImageTk.PhotoImage(img)
         tk.Label(f, image=photo_ref, bg=BG, bd=0).pack()
         return
     tk.Label(f, text=card["name"], bg=BG, fg="#e8d9b0",
-             font=("Georgia", 14, "bold")).pack(pady=(0, 6))
-    if img is not None:
-        photo_ref = ImageTk.PhotoImage(img)
-        tk.Label(f, image=photo_ref, bg=BG).pack()
+             font=("Georgia", 15, "bold"), wraplength=300).pack(pady=(0, 8))
+    tk.Frame(f, bg="#6b5a37", height=1).pack(fill="x", pady=2)
     if card.get("stack"):
         tk.Label(f, text=f"Stack size: {card['stack']}", bg=BG, fg="#ffffff",
-                 font=("Segoe UI", 11, "bold")).pack(pady=(8, 2))
-    for color, txt in parse_reward(card.get("reward", "")):
-        tk.Label(f, text=txt, bg=BG, fg=color, font=("Segoe UI", 11),
-                 wraplength=280, justify="center").pack()
-    flavour = re.sub(r"<[^>]+>|[{}]", "", card.get("flavour", "")).strip()
-    if flavour:
-        tk.Label(f, text=flavour, bg=BG, fg="#c8741c", font=("Georgia", 9, "italic"),
-                 wraplength=280, justify="center").pack(pady=(8, 0))
+                 font=("Segoe UI", 12, "bold")).pack(pady=(8, 8))
+    tk.Frame(f, bg="#6b5a37", height=1).pack(fill="x", pady=2)
+    for text, color in card.get("lines", []):
+        tk.Label(f, text=text, bg=BG, fg=color, font=("Segoe UI", 13, "bold"),
+                 wraplength=300, justify="center").pack(pady=1)
+    if not card.get("lines"):
+        tk.Label(f, text="(no reward data)", bg=BG, fg="#7a7a7a",
+                 font=("Segoe UI", 11)).pack(pady=6)
 
 
 def build_msg(f, msg):
@@ -491,8 +431,8 @@ def poll():
             if job[0] == "hide":
                 close_popup()
             elif job[0] == "card":
-                _, card, amount, img, own, cursor, tip_cx = job
-                show_popup(lambda f: build_card(f, card, amount, img, own), cursor, tip_cx)
+                _, card, amount, img, cursor, tip_cx = job
+                show_popup(lambda f: build_card(f, card, amount, img), cursor, tip_cx)
             elif job[0] == "msg":
                 msg, cursor = job[1], job[2]
                 show_popup(lambda f: build_msg(f, msg), cursor, None)
@@ -511,7 +451,6 @@ def main():
         return
     root = tk.Tk()
     root.withdraw()
-    threading.Thread(target=prefetch_images, daemon=True).start()
     threading.Thread(target=lambda: (get_ocr(), print("[ok] text recognition ready")),
                      daemon=True).start()
     try:
