@@ -1,0 +1,7 @@
+requests
+keyboard
+pillow
+mss
+numpy
+rapidfuzz
+rapidocr-onnxruntime
