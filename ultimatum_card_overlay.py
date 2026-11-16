@@ -32,6 +32,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+from urllib.parse import quote
 
 import keyboard
 import mss
@@ -59,11 +60,13 @@ REGION_UP = 500
 REGION_DOWN = 500
 MATCH_CUTOFF = 85         # 0-100, how close the OCR text must be to a real card name
 TOOLTIP_HALF_WIDTH = 300  # pop-up is placed this far from the tooltip's centre
+POPUP_SHIFT_CM = 3        # extra distance (cm) of the pop-up from the tooltip, away from it
 MAX_SECONDS = 60          # safety: pop-up never stays longer than this
 
 POEDB_URL = "https://poedb.tw/us/Divination_Cards"
 ULTIMATUM_URL = "https://poedb.tw/us/Inscribed_Ultimatum"
 ITEM_URL = "https://poedb.tw/us/"
+TRADE_ITEMS_URL = "https://www.pathofexile.com/api/trade/data/items"
 HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
@@ -83,6 +86,7 @@ DATA_DIR = os.path.join(BASE, "card_data")
 OWN_DIR = os.path.join(BASE, "card_images")
 CARDS_JSON = os.path.join(DATA_DIR, "cards.json")
 UNIQUES_JSON = os.path.join(DATA_DIR, "uniques.json")
+TRADE_NAMES_JSON = os.path.join(DATA_DIR, "all_unique_names.json")
 UNIQUE_IMG_DIR = os.path.join(DATA_DIR, "unique_img")
 for _d in (DATA_DIR, OWN_DIR, UNIQUE_IMG_DIR):
     os.makedirs(_d, exist_ok=True)
@@ -231,11 +235,53 @@ def load_table(label, url, path, parser, target, min_count, probes):
     print(f"[ok] {len(target)} {label} known")
 
 
+def name_to_slug(name):
+    """'Doryani's Fist' -> 'Doryanis_Fist', 'Jack, the Axe' -> 'Jack%2C_the_Axe'"""
+    return quote(re.sub(r"['\u2019`]", "", name).replace(" ", "_"), safe="_-.~")
+
+
+def load_all_unique_names():
+    """All unique item names from the official trade site data. The Ultimatum list on poedb
+    does not contain every possible reward (e.g. drop-restricted uniques like The Immortal Will)."""
+    names = []
+    if os.path.exists(TRADE_NAMES_JSON) and \
+            (time.time() - os.path.getmtime(TRADE_NAMES_JSON)) < 14 * 86400:
+        with open(TRADE_NAMES_JSON, encoding="utf-8") as f:
+            names = json.load(f)
+    else:
+        try:
+            r = requests.get(TRADE_ITEMS_URL, timeout=30, headers={
+                **HEADERS, "User-Agent": "ultimatum-card-overlay/2.1 (personal hobby tool)"})
+            r.raise_for_status()
+            found = set()
+            for group in r.json().get("result", []):
+                for e in group.get("entries", []):
+                    if (e.get("flags") or {}).get("unique") and e.get("name"):
+                        found.add(e["name"])
+            names = sorted(found)
+            print(f"[info] trade site: {len(names)} unique item names found")
+            if len(names) >= 300:
+                with open(TRADE_NAMES_JSON, "w", encoding="utf-8") as f:
+                    json.dump(names, f, ensure_ascii=False)
+        except Exception as e:
+            print(f"[warn] could not download the full unique item list: {e}")
+            if os.path.exists(TRADE_NAMES_JSON):
+                with open(TRADE_NAMES_JSON, encoding="utf-8") as f:
+                    names = json.load(f)
+    added = 0
+    for n in names:
+        if n not in uniques:
+            uniques[n] = {"name": n, "tier": "-", "slug": name_to_slug(n)}
+            added += 1
+    print(f"[ok] {len(uniques)} unique items known ({added} not on the Ultimatum list)")
+
+
 def load_cards():
     load_table("cards", POEDB_URL, CARDS_JSON, parse_poedb, cards, 100,
                ("Three_Faces_in_the_Dark", "The_Doctor", "Divination Cards Item"))
     load_table("unique items", ULTIMATUM_URL, UNIQUES_JSON, parse_unique_list, uniques, 100,
                ("Goldwyrm", "Uniques /"))
+    load_all_unique_names()
 
 
 def find_og_image(html):
@@ -431,7 +477,7 @@ def scan(pos, forced=False):
     reward = find_unique_reward(items)
     if reward:
         uniq, tip_cx = reward
-        print(f"[hit] reward: {uniq['name']} ({uniq['tier']})")
+        print(f"[hit] reward: {uniq['name']}")
         own = get_own_image(uniq)
         img = own if own is not None else fetch_unique_image(uniq)
         jobs.put(("unique", uniq, img, own is not None, pos, tip_cx))
@@ -522,12 +568,13 @@ def show_popup(build, cursor, tip_cx):
     win.update_idletasks()
     w, h = win.winfo_width(), win.winfo_height()
     sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+    shift = int(root.winfo_fpixels("1c") * POPUP_SHIFT_CM)
     if tip_cx is None:
-        x = cursor[0] + 30
+        x = cursor[0] + 30 + shift
     else:
-        x = int(tip_cx + TOOLTIP_HALF_WIDTH + 12)          # right of the tooltip
+        x = int(tip_cx + TOOLTIP_HALF_WIDTH + 12 + shift)            # right of the tooltip
         if x + w > sw - 10:
-            x = int(tip_cx - TOOLTIP_HALF_WIDTH - 12 - w)  # otherwise left of it
+            x = int(tip_cx - TOOLTIP_HALF_WIDTH - 12 - shift - w)    # otherwise left of it
     x = max(10, min(x, sw - w - 10))
     y = max(10, min(cursor[1] - h // 2, sh - h - 10))
     win.geometry(f"+{x}+{y}")
@@ -572,8 +619,9 @@ def build_unique(f, uniq, img, own):
     else:
         tk.Label(f, text="(no picture available)", bg=BG, fg="#7a7a7a",
                  font=("Segoe UI", 11)).pack(pady=6)
-    tk.Label(f, text=f"Unique reward  |  tier {uniq['tier']}", bg=BG, fg="#9a9a9a",
-             font=("Segoe UI", 9)).pack(pady=(8, 0))
+    tier = uniq.get("tier")
+    info = "Unique reward" + (f"  |  tier {tier}" if tier and tier != "-" else "")
+    tk.Label(f, text=info, bg=BG, fg="#9a9a9a", font=("Segoe UI", 9)).pack(pady=(8, 0))
 
 
 def build_msg(f, msg):
