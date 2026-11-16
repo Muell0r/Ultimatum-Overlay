@@ -1,26 +1,29 @@
 """
 Inscribed Ultimatum -> Divination Card overlay for Path of Exile 1  (screen reading)
 
-Hover an Inscribed Ultimatum, keep the mouse still for a moment, and a card pop-up
-(name, stack size, reward) appears next to the tooltip. Move the mouse and it
-disappears. Press F8 to force a scan.
+Hover an Inscribed Ultimatum, keep the mouse still for a moment, and a pop-up appears
+next to the tooltip. Move the mouse and it disappears. Press F8 to force a scan.
+  - Ultimatum that asks for divination cards: the card (name, stack size, reward)
+  - Ultimatum whose reward is a unique item:  the unique item's picture
 
 The tool only takes a screenshot around the mouse cursor and reads the text with
 OCR. It never touches the game client or its memory.
 
-Card data (names, stack sizes, rewards) is downloaded once from poedb.tw on the
-first start (internet needed) and stored in the folder "card_data" next to this
-file. Delete cards.json in that folder to force a fresh download.
+Card and unique item data is downloaded from poedb.tw on the first start (internet
+needed) and stored in the folder "card_data" next to this file. Item pictures are
+downloaded the first time an item is shown. Delete the .json files in that folder
+to force a fresh download.
 
 Want your own full card pictures (e.g. screenshots of the real cards)?
 Put them in the folder "card_images" and name them after the card, e.g.
-    card_images\\The Fox in the Brambles.png
-Those pictures are shown instead of the built-in card layout.
+    card_images\\The Fox in the Brambles.png      (works for unique items too)
+Those pictures are shown instead of the built-in layout.
 
 Run in windowed or borderless windowed mode (an overlay can't draw over exclusive fullscreen).
 """
 
 import ctypes
+import io
 import json
 import os
 import queue
@@ -59,6 +62,8 @@ TOOLTIP_HALF_WIDTH = 300  # pop-up is placed this far from the tooltip's centre
 MAX_SECONDS = 60          # safety: pop-up never stays longer than this
 
 POEDB_URL = "https://poedb.tw/us/Divination_Cards"
+ULTIMATUM_URL = "https://poedb.tw/us/Inscribed_Ultimatum"
+ITEM_URL = "https://poedb.tw/us/"
 HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
@@ -77,7 +82,9 @@ BASE = base_dir()
 DATA_DIR = os.path.join(BASE, "card_data")
 OWN_DIR = os.path.join(BASE, "card_images")
 CARDS_JSON = os.path.join(DATA_DIR, "cards.json")
-for _d in (DATA_DIR, OWN_DIR):
+UNIQUES_JSON = os.path.join(DATA_DIR, "uniques.json")
+UNIQUE_IMG_DIR = os.path.join(DATA_DIR, "unique_img")
+for _d in (DATA_DIR, OWN_DIR, UNIQUE_IMG_DIR):
     os.makedirs(_d, exist_ok=True)
 
 
@@ -163,34 +170,107 @@ def parse_poedb(html):
     return out
 
 
-def load_cards():
-    exists = os.path.exists(CARDS_JSON)
-    stale = exists and (time.time() - os.path.getmtime(CARDS_JSON)) > 14 * 86400
+def parse_unique_list(html):
+    """Unique items that can appear in Inscribed Ultimatums (table 'Uniques' on poedb.tw)."""
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(html, "html.parser")
+    heading = None
+    for t in soup.find_all(string=re.compile(r"Uniques\s*/\s*\d+")):
+        if t.find_parent(["a", "nav", "script", "style", "title"]) is None:
+            heading = t
+            break
+    table = heading.find_next("table") if heading is not None else None
+    out = {}
+    if table is None:
+        return out
+    for tr in table.find_all("tr"):
+        tds = tr.find_all("td")
+        if len(tds) < 2:
+            continue
+        tier = _norm(tds[0].get_text(" "))
+        name = _norm(tds[1].get_text(" "))
+        if not name:
+            continue
+        a = tds[1].find("a")
+        href = a.get("href", "") if a is not None else ""
+        slug = href.rstrip("/").split("/")[-1] if href else name.replace(" ", "_")
+        out[name] = {"name": name, "tier": tier, "slug": slug}
+    return out
+
+
+uniques = {}   # unique item name -> {"name", "tier", "slug"}
+
+
+def load_table(label, url, path, parser, target, min_count, probes):
+    exists = os.path.exists(path)
+    stale = exists and (time.time() - os.path.getmtime(path)) > 14 * 86400
     if not exists or stale:
         try:
-            r = requests.get(POEDB_URL, headers=HEADERS, timeout=30)
+            r = requests.get(url, headers=HEADERS, timeout=30)
             r.raise_for_status()
-            data = parse_poedb(r.text)
-            print(f"[info] poedb.tw: {len(data)} cards found")
-            if len(data) >= 100:
-                with open(CARDS_JSON, "w", encoding="utf-8") as f:
+            data = parser(r.text)
+            print(f"[info] poedb.tw: {len(data)} {label} found")
+            if len(data) >= min_count:
+                with open(path, "w", encoding="utf-8") as f:
                     json.dump(data, f, ensure_ascii=False)
             else:
-                print("[warn] too few cards found, the page layout may have changed.")
-                for key in ("Three_Faces_in_the_Dark", "The_Doctor", "Divination Cards Item"):
+                print(f"[warn] too few {label} found, the page layout may have changed.")
+                for key in probes:
                     i = r.text.find(key)
                     if i >= 0:
-                        print("       page code around the first card:")
+                        print("       page code around the first entry:")
                         print("       " + r.text[max(0, i - 400): i + 800].replace("\n", " "))
                         break
                 else:
                     print("       start of the page:", r.text[:300].replace("\n", " "))
         except Exception as e:
-            print(f"[warn] could not download card data: {e}")
-    if os.path.exists(CARDS_JSON):
-        with open(CARDS_JSON, encoding="utf-8") as f:
-            cards.update(json.load(f))
-    print(f"[ok] {len(cards)} cards known")
+            print(f"[warn] could not download {label}: {e}")
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            target.update(json.load(f))
+    print(f"[ok] {len(target)} {label} known")
+
+
+def load_cards():
+    load_table("cards", POEDB_URL, CARDS_JSON, parse_poedb, cards, 100,
+               ("Three_Faces_in_the_Dark", "The_Doctor", "Divination Cards Item"))
+    load_table("unique items", ULTIMATUM_URL, UNIQUES_JSON, parse_unique_list, uniques, 100,
+               ("Goldwyrm", "Uniques /"))
+
+
+def find_og_image(html):
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(html, "html.parser")
+    for attr in ("property", "name"):
+        tag = soup.find("meta", attrs={attr: "og:image"})
+        if tag is not None and tag.get("content"):
+            return tag["content"]
+    m = re.search(r"https://cdn\.poedb\.tw/image/Art/2DItems/[^\"'\s)]+\.webp", html)
+    return m.group(0) if m else None
+
+
+def fetch_unique_image(u):
+    """Item picture from the item's poedb.tw page, cached in card_data/unique_img."""
+    path = os.path.join(UNIQUE_IMG_DIR, safe(u["name"]) + ".png")
+    if not os.path.exists(path):
+        try:
+            r = requests.get(ITEM_URL + u["slug"], headers=HEADERS, timeout=20)
+            r.raise_for_status()
+            url = find_og_image(r.text)
+            if not url:
+                print(f"[warn] no picture found on the page of {u['name']}")
+                return None
+            data = requests.get(url, headers=HEADERS, timeout=20).content
+            Image.open(io.BytesIO(data)).convert("RGBA").save(path)
+        except Exception as e:
+            print(f"[warn] could not get the picture of {u['name']}: {e}")
+            return None
+    try:
+        img = Image.open(path).convert("RGBA")
+    except Exception:
+        return None
+    f = 200 / max(img.size)
+    return img.resize((max(1, int(img.width * f)), max(1, int(img.height * f))), Image.LANCZOS)
 
 
 def find_own_image(name):
@@ -233,7 +313,7 @@ def get_ocr():
 
 
 def grab(cx, cy):
-    with mss.mss() as sct:
+    with (getattr(mss, "MSS", None) or mss.mss)() as sct:
         mon = sct.monitors[0]  # all screens together
         left = max(mon["left"], cx - REGION_HALF_WIDTH)
         top = max(mon["top"], cy - REGION_UP)
@@ -290,6 +370,39 @@ def find_card(items):
     return cards[best[1]], best[2], best[3]
 
 
+def find_unique_reward(items):
+    """Looks for 'Reward: <unique item>' and matches the name against the Ultimatum uniques.
+    Returns (unique, tooltip_center_x) or None."""
+    names = list(uniques.keys())
+    if not names:
+        return None
+    best = None
+    for it in items:
+        x1, x2, cy, h, text = it
+        label = text.split(":", 1)[0].strip().lower()
+        if fuzz.ratio(label, "reward") < 75:
+            continue
+        left, right = x1, x2
+        cand = text.split(":", 1)[1] if ":" in text else ""
+        if not cand.strip():
+            same = [o for o in items
+                    if o is not it and abs(o[2] - cy) < max(h, 10) * 0.7 and o[0] >= x1]
+            if same:
+                nxt = min(same, key=lambda o: o[0])
+                cand = nxt[4]
+                right = max(right, nxt[1])
+        cand = cand.strip()
+        if len(cand) < 3:
+            continue
+        hit = process.extractOne(cand, names, scorer=fuzz.ratio,
+                                 processor=utils.default_process, score_cutoff=MATCH_CUTOFF)
+        if hit and (best is None or hit[1] > best[0]):
+            best = (hit[1], hit[0], (left + right) / 2)
+    if not best:
+        return None
+    return uniques[best[1]], best[2]
+
+
 # ------------------------------------------------------------------ worker
 jobs = queue.Queue()              # worker thread -> UI thread
 popup_visible = threading.Event()
@@ -315,10 +428,21 @@ def scan(pos, forced=False):
         ys = [p[1] for p in box]
         items.append((left + min(xs), left + max(xs),
                       top + (min(ys) + max(ys)) / 2, max(ys) - min(ys), text))
+    reward = find_unique_reward(items)
+    if reward:
+        uniq, tip_cx = reward
+        print(f"[hit] reward: {uniq['name']} ({uniq['tier']})")
+        own = get_own_image(uniq)
+        img = own if own is not None else fetch_unique_image(uniq)
+        jobs.put(("unique", uniq, img, own is not None, pos, tip_cx))
+        return
     found = find_card(items)
     if not found:
         if forced:
-            jobs.put(("msg", "No Inscribed Ultimatum with a known card found at the cursor.", pos))
+            print("[debug] no card found. Text read around the cursor:")
+            for it in items[:40]:
+                print("        ", it[4])
+            jobs.put(("msg", "No Inscribed Ultimatum with a known card or unique reward found at the cursor.", pos))
         return
     card, amount, tip_cx = found
     print(f"[hit] {card['name']} (x{amount})")
@@ -434,6 +558,24 @@ def build_card(f, card, amount, img):
                  font=("Segoe UI", 11)).pack(pady=6)
 
 
+def build_unique(f, uniq, img, own):
+    global photo_ref
+    if own and img is not None:
+        photo_ref = ImageTk.PhotoImage(img)
+        tk.Label(f, image=photo_ref, bg=BG, bd=0).pack()
+        return
+    tk.Label(f, text=uniq["name"], bg=BG, fg="#af6025",
+             font=("Georgia", 15, "bold"), wraplength=300).pack(pady=(0, 8))
+    if img is not None:
+        photo_ref = ImageTk.PhotoImage(img)
+        tk.Label(f, image=photo_ref, bg=BG).pack()
+    else:
+        tk.Label(f, text="(no picture available)", bg=BG, fg="#7a7a7a",
+                 font=("Segoe UI", 11)).pack(pady=6)
+    tk.Label(f, text=f"Unique reward  |  tier {uniq['tier']}", bg=BG, fg="#9a9a9a",
+             font=("Segoe UI", 9)).pack(pady=(8, 0))
+
+
 def build_msg(f, msg):
     tk.Label(f, text=msg, bg=BG, fg="#d20000", font=("Segoe UI", 10), wraplength=280).pack()
 
@@ -447,6 +589,9 @@ def poll():
             elif job[0] == "card":
                 _, card, amount, img, cursor, tip_cx = job
                 show_popup(lambda f: build_card(f, card, amount, img), cursor, tip_cx)
+            elif job[0] == "unique":
+                _, uniq, img, own, cursor, tip_cx = job
+                show_popup(lambda f: build_unique(f, uniq, img, own), cursor, tip_cx)
             elif job[0] == "msg":
                 msg, cursor = job[1], job[2]
                 show_popup(lambda f: build_msg(f, msg), cursor, None)
@@ -459,8 +604,8 @@ def poll():
 def main():
     global root
     load_cards()
-    if not cards:
-        print("[error] no card data available. Connect to the internet and start again.")
+    if not cards and not uniques:
+        print("[error] no data available. Connect to the internet and start again.")
         input("Press Enter to close...")
         return
     root = tk.Tk()
