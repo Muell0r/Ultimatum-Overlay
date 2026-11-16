@@ -5,6 +5,7 @@ Hover an Inscribed Ultimatum, keep the mouse still for a moment, and a pop-up ap
 next to the tooltip. Move the mouse and it disappears. Press F8 to force a scan.
   - Ultimatum that asks for divination cards: the card (name, stack size, reward)
   - Ultimatum whose reward is a unique item:  the unique item's picture
+Both pop-ups also show the current price from poe.ninja (league: see LEAGUE below).
 
 The tool only takes a screenshot around the mouse cursor and reads the text with
 OCR. It never touches the game client or its memory.
@@ -60,6 +61,8 @@ REGION_UP = 500
 REGION_DOWN = 500
 MATCH_CUTOFF = 85         # 0-100, how close the OCR text must be to a real card name
 TOOLTIP_HALF_WIDTH = 300  # pop-up is placed this far from the tooltip's centre
+LEAGUE = "Covens"         # league name as on poe.ninja ("auto" = current challenge league)
+PRICE_REFRESH_MINUTES = 30  # poe.ninja updates about every 15 minutes
 POPUP_SHIFT_CM = 3        # extra distance (cm) of the pop-up from the tooltip, away from it
 MAX_SECONDS = 60          # safety: pop-up never stays longer than this
 
@@ -73,6 +76,7 @@ HEADERS = {
     "Accept-Language": "en",
 }
 BG = "#0d0b09"
+VERSION = "3.1 (with price check)"
 
 # ------------------------------------------------------------------ paths
 def base_dir():
@@ -87,6 +91,7 @@ OWN_DIR = os.path.join(BASE, "card_images")
 CARDS_JSON = os.path.join(DATA_DIR, "cards.json")
 UNIQUES_JSON = os.path.join(DATA_DIR, "uniques.json")
 TRADE_NAMES_JSON = os.path.join(DATA_DIR, "all_unique_names.json")
+PRICES_JSON = os.path.join(DATA_DIR, "prices.json")
 UNIQUE_IMG_DIR = os.path.join(DATA_DIR, "unique_img")
 for _d in (DATA_DIR, OWN_DIR, UNIQUE_IMG_DIR):
     os.makedirs(_d, exist_ok=True)
@@ -284,6 +289,201 @@ def load_cards():
     load_all_unique_names()
 
 
+# ------------------------------------------------------------------ prices (poe.ninja)
+NINJA = "https://poe.ninja"
+NINJA_HEADERS = {"User-Agent": "ultimatum-card-overlay/3.0 (personal hobby tool, price check)"}
+UNIQUE_TYPES = ["UniqueWeapon", "UniqueArmour", "UniqueAccessory",
+                "UniqueFlask", "UniqueJewel", "UniqueTincture"]
+
+prices = {"setting": "", "league": "", "time": 0.0, "unit": "", "cards": {}, "uniques": {}}
+price_index = {"cards": {}, "uniques": {}}
+
+
+def norm_key(name):
+    return re.sub(r"[^a-z0-9]", "", name.lower())
+
+
+def rebuild_price_index():
+    for kind in ("cards", "uniques"):
+        price_index[kind] = {norm_key(k): v for k, v in prices[kind].items()}
+
+
+def ninja_get(path, **params):
+    r = requests.get(NINJA + path, params=params, headers=NINJA_HEADERS, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+def resolve_league():
+    want = LEAGUE.strip().lower()
+    try:
+        leagues = ninja_get("/poe1/api/economy/leagues")
+    except Exception as e:
+        print(f"[warn] league list not available ({e}); using '{LEAGUE}' directly")
+        return LEAGUE
+    if not isinstance(leagues, list) or not leagues:
+        return LEAGUE
+    if want != "auto":
+        for lg in leagues:
+            if want in (str(lg.get("id", "")).lower(), str(lg.get("name", "")).lower()):
+                return lg.get("id") or lg.get("name")
+        print(f"[warn] league '{LEAGUE}' not found on poe.ninja, using the current league "
+              f"'{leagues[0].get('name')}' instead")
+    return leagues[0].get("id") or leagues[0].get("name")
+
+
+def exchange_prices(league, typ):
+    """Returns ({item name: price in the primary currency}, core)."""
+    data = ninja_get("/poe1/api/economy/exchange/current/overview", league=league, type=typ)
+    core = data.get("core") or {}
+    items = core.get("items")
+    if isinstance(items, dict):
+        items = [dict(v, id=v.get("id", k)) if isinstance(v, dict) else {"id": k, "name": v}
+                 for k, v in items.items()]
+    names = {}
+    for it in items or []:
+        if isinstance(it, dict) and it.get("name"):
+            for key in ("id", "detailsId"):
+                if it.get(key) is not None:
+                    names[str(it[key])] = it["name"]
+    out = {}
+    for line in data.get("lines") or []:
+        nm = names.get(str(line.get("id")))
+        if nm and line.get("primaryValue") is not None:
+            out[nm] = float(line["primaryValue"])
+    if not out:
+        print(f"[info] no prices found for {typ}. Start of the answer:")
+        print("       " + json.dumps(data)[:600])
+    return out, core
+
+
+def stash_unique_prices(league):
+    out = {}
+    for typ in UNIQUE_TYPES:
+        try:
+            data = ninja_get("/poe1/api/economy/stash/current/item/overview",
+                             league=league, type=typ)
+        except Exception as e:
+            print(f"[info] unique prices {typ}: {e}")
+            continue
+        by_name = {}
+        for line in data.get("lines") or []:
+            if line.get("name"):
+                by_name.setdefault(line["name"], []).append(line)
+        for name, lines in by_name.items():
+            plain = [l for l in lines if not ((l.get("links") or 0) >= 5)] or lines
+            best = max(plain, key=lambda l: l.get("listingCount") or l.get("count") or 0)
+            out[name] = {"c": best.get("chaosValue"), "d": best.get("divineValue"),
+                         "n": best.get("listingCount")}
+        time.sleep(0.4)
+    return out
+
+
+def refresh_prices():
+    print(f"[info] loading prices from poe.ninja (league setting: {LEAGUE}) ...")
+    league = resolve_league()
+    cur, core = exchange_prices(league, "Currency")
+    primary = json.dumps(core.get("primary")).lower()
+    chaos_v = cur.get("Chaos Orb") or (1.0 if "chaos" in primary else None)
+    divine_v = cur.get("Divine Orb") or (1.0 if "divine" in primary else None)
+    cards_raw, _ = exchange_prices(league, "DivinationCard")
+    new_cards = {}
+    for name, v in cards_raw.items():
+        new_cards[name] = {"c": v / chaos_v if chaos_v else None,
+                           "d": v / divine_v if divine_v else None, "raw": v}
+    new_uniques = stash_unique_prices(league)
+    if not new_cards and not new_uniques:
+        raise RuntimeError("poe.ninja returned no prices")
+    prices.update({"setting": LEAGUE, "league": league, "time": time.time(),
+                   "unit": primary.strip('"'), "cards": new_cards, "uniques": new_uniques})
+    rebuild_price_index()
+    with open(PRICES_JSON, "w", encoding="utf-8") as f:
+        json.dump(prices, f, ensure_ascii=False)
+    note = "" if (chaos_v and divine_v) else "  (chaos/divine conversion incomplete)"
+    print(f"[ok] prices for league '{league}': {len(new_cards)} cards, "
+          f"{len(new_uniques)} uniques{note}")
+
+
+def load_price_cache():
+    try:
+        with open(PRICES_JSON, encoding="utf-8") as f:
+            data = json.load(f)
+        if data.get("setting") == LEAGUE:
+            prices.update(data)
+            rebuild_price_index()
+    except Exception:
+        pass
+
+
+def price_loop():
+    while True:
+        try:
+            if time.time() - prices["time"] > PRICE_REFRESH_MINUTES * 60:
+                refresh_prices()
+        except Exception as e:
+            print(f"[warn] could not load prices: {e}")
+        time.sleep(300)
+
+
+def get_price(kind, name):
+    return price_index[kind].get(norm_key(name))
+
+
+def _num(x):
+    t = f"{x:.1f}" if x < 10 else f"{x:.0f}"
+    return t.rstrip("0").rstrip(".") if "." in t else t
+
+
+def fmt_price(p):
+    if not p:
+        return None
+    c, d = p.get("c"), p.get("d")
+    if d is not None and d >= 1:
+        return f"{_num(d)} div" + (f" (~{_num(c)}c)" if c is not None else "")
+    if c is not None:
+        return f"{_num(c)}c"
+    if p.get("raw") is not None:
+        return f"{_num(p['raw'])} {prices.get('unit', '')}".strip()
+    return None
+
+
+def scaled(p, n):
+    return {k: (v * n if isinstance(v, (int, float)) else v) for k, v in p.items()}
+
+
+GOLD, GREY, GREEN, RED = "#e8d9b0", "#9a9a9a", "#5fbf5f", "#d24a4a"
+
+
+def card_price_lines(card, amount):
+    if not prices["time"]:
+        return [("Prices not loaded yet", GREY)]
+    p = get_price("cards", card["name"])
+    if not p:
+        return [("Price: not found", GREY)]
+    lines = [(f"Price: {fmt_price(p)} each", GOLD)]
+    if amount > 1:
+        lines.append((f"x{amount}: {fmt_price(scaled(p, amount))}", GREY))
+    return lines
+
+
+def unique_price_lines(uniq, sacrifice):
+    if not prices["time"]:
+        return [("Prices not loaded yet", GREY)]
+    rp = get_price("uniques", uniq["name"])
+    lines = [(f"Price: {fmt_price(rp)}" if fmt_price(rp) else "Price: not found",
+              GOLD if rp else GREY)]
+    if sacrifice:
+        sp = get_price("uniques", sacrifice["name"])
+        lines.append((f"Sacrifice: {sacrifice['name']}  {fmt_price(sp) or 'price not found'}", GREY))
+        if rp and sp and rp.get("c") is not None and sp.get("c") is not None:
+            dc = rp["c"] - sp["c"]
+            dd = (rp["d"] - sp["d"]) if rp.get("d") is not None and sp.get("d") is not None else None
+            txt = ("+" if dc >= 0 else "-") + (fmt_price({"c": abs(dc),
+                   "d": abs(dd) if dd is not None else None}) or "")
+            lines.append((f"Difference: {txt}", GREEN if dc >= 0 else RED))
+    return lines
+
+
 def find_og_image(html):
     from bs4 import BeautifulSoup
     soup = BeautifulSoup(html, "html.parser")
@@ -416,17 +616,13 @@ def find_card(items):
     return cards[best[1]], best[2], best[3]
 
 
-def find_unique_reward(items):
-    """Looks for 'Reward: <unique item>' and matches the name against the Ultimatum uniques.
-    Returns (unique, tooltip_center_x) or None."""
-    names = list(uniques.keys())
-    if not names:
-        return None
+def name_after_label(items, is_label, names, count=False):
+    """Finds '<label>: <name>' in the OCR items and fuzzy-matches the name.
+    Returns (score, name, tooltip_center_x) or None."""
     best = None
     for it in items:
         x1, x2, cy, h, text = it
-        label = text.split(":", 1)[0].strip().lower()
-        if fuzz.ratio(label, "reward") < 75:
+        if not is_label(text):
             continue
         left, right = x1, x2
         cand = text.split(":", 1)[1] if ":" in text else ""
@@ -437,16 +633,35 @@ def find_unique_reward(items):
                 nxt = min(same, key=lambda o: o[0])
                 cand = nxt[4]
                 right = max(right, nxt[1])
-        cand = cand.strip()
+        cand = strip_count(cand)[0] if count else cand.strip()
         if len(cand) < 3:
             continue
         hit = process.extractOne(cand, names, scorer=fuzz.ratio,
                                  processor=utils.default_process, score_cutoff=MATCH_CUTOFF)
         if hit and (best is None or hit[1] > best[0]):
             best = (hit[1], hit[0], (left + right) / 2)
-    if not best:
+    return best
+
+
+def find_unique_reward(items):
+    """'Reward: <unique item>'. Returns (unique, tooltip_center_x) or None."""
+    names = list(uniques.keys())
+    if not names:
         return None
-    return uniques[best[1]], best[2]
+    best = name_after_label(
+        items, lambda t: fuzz.ratio(t.split(":", 1)[0].strip().lower(), "reward") >= 75, names)
+    return (uniques[best[1]], best[2]) if best else None
+
+
+def find_sacrifice_unique(items):
+    """'Requires Sacrifice: <unique item>' (only for Ultimatums that swap one unique for another)."""
+    names = list(uniques.keys())
+    if not names:
+        return None
+    best = name_after_label(
+        items, lambda t: len(t) >= 9 and fuzz.partial_ratio("sacrifice", t.lower()) >= 80,
+        names, count=True)
+    return uniques[best[1]] if best else None
 
 
 # ------------------------------------------------------------------ worker
@@ -480,7 +695,9 @@ def scan(pos, forced=False):
         print(f"[hit] reward: {uniq['name']}")
         own = get_own_image(uniq)
         img = own if own is not None else fetch_unique_image(uniq)
-        jobs.put(("unique", uniq, img, own is not None, pos, tip_cx))
+        extra = unique_price_lines(uniq, find_sacrifice_unique(items))
+        print("[price] " + " | ".join(t for t, _ in extra))
+        jobs.put(("unique", uniq, img, own is not None, pos, tip_cx, extra))
         return
     found = find_card(items)
     if not found:
@@ -492,7 +709,9 @@ def scan(pos, forced=False):
         return
     card, amount, tip_cx = found
     print(f"[hit] {card['name']} (x{amount})")
-    jobs.put(("card", card, amount, get_own_image(card), pos, tip_cx))
+    extra = card_price_lines(card, amount)
+    print("[price] " + " | ".join(t for t, _ in extra))
+    jobs.put(("card", card, amount, get_own_image(card), pos, tip_cx, extra))
 
 
 def watcher():
@@ -584,11 +803,18 @@ def show_popup(build, cursor, tip_cx):
     hide_job = root.after(MAX_SECONDS * 1000, close_popup)
 
 
-def build_card(f, card, amount, img):
+def add_extra(f, extra):
+    for text, color in extra:
+        tk.Label(f, text=text, bg=BG, fg=color, font=("Segoe UI", 11, "bold"),
+                 wraplength=300, justify="center").pack(pady=(5, 0))
+
+
+def build_card(f, card, amount, img, extra):
     global photo_ref
     if img is not None:                            # your own full card picture, shown as is
         photo_ref = ImageTk.PhotoImage(img)
         tk.Label(f, image=photo_ref, bg=BG, bd=0).pack()
+        add_extra(f, extra)
         return
     tk.Label(f, text=card["name"], bg=BG, fg="#e8d9b0",
              font=("Georgia", 15, "bold"), wraplength=300).pack(pady=(0, 8))
@@ -603,13 +829,16 @@ def build_card(f, card, amount, img):
     if not card.get("lines"):
         tk.Label(f, text="(no reward data)", bg=BG, fg="#7a7a7a",
                  font=("Segoe UI", 11)).pack(pady=6)
+    tk.Frame(f, bg="#6b5a37", height=1).pack(fill="x", pady=(8, 2))
+    add_extra(f, extra)
 
 
-def build_unique(f, uniq, img, own):
+def build_unique(f, uniq, img, own, extra):
     global photo_ref
     if own and img is not None:
         photo_ref = ImageTk.PhotoImage(img)
         tk.Label(f, image=photo_ref, bg=BG, bd=0).pack()
+        add_extra(f, extra)
         return
     tk.Label(f, text=uniq["name"], bg=BG, fg="#af6025",
              font=("Georgia", 15, "bold"), wraplength=300).pack(pady=(0, 8))
@@ -622,6 +851,8 @@ def build_unique(f, uniq, img, own):
     tier = uniq.get("tier")
     info = "Unique reward" + (f"  |  tier {tier}" if tier and tier != "-" else "")
     tk.Label(f, text=info, bg=BG, fg="#9a9a9a", font=("Segoe UI", 9)).pack(pady=(8, 0))
+    tk.Frame(f, bg="#6b5a37", height=1).pack(fill="x", pady=(8, 2))
+    add_extra(f, extra)
 
 
 def build_msg(f, msg):
@@ -635,11 +866,11 @@ def poll():
             if job[0] == "hide":
                 close_popup()
             elif job[0] == "card":
-                _, card, amount, img, cursor, tip_cx = job
-                show_popup(lambda f: build_card(f, card, amount, img), cursor, tip_cx)
+                _, card, amount, img, cursor, tip_cx, extra = job
+                show_popup(lambda f: build_card(f, card, amount, img, extra), cursor, tip_cx)
             elif job[0] == "unique":
-                _, uniq, img, own, cursor, tip_cx = job
-                show_popup(lambda f: build_unique(f, uniq, img, own), cursor, tip_cx)
+                _, uniq, img, own, cursor, tip_cx, extra = job
+                show_popup(lambda f: build_unique(f, uniq, img, own, extra), cursor, tip_cx)
             elif job[0] == "msg":
                 msg, cursor = job[1], job[2]
                 show_popup(lambda f: build_msg(f, msg), cursor, None)
@@ -658,6 +889,8 @@ def main():
         return
     root = tk.Tk()
     root.withdraw()
+    load_price_cache()
+    threading.Thread(target=price_loop, daemon=True).start()
     threading.Thread(target=lambda: (get_ocr(), print("[ok] text recognition ready")),
                      daemon=True).start()
     try:
@@ -666,7 +899,7 @@ def main():
         print(f"[warn] hotkey not available ({e}); automatic mode still works")
     threading.Thread(target=watcher, daemon=True).start()
     mode = "automatic (rest the mouse on the item)" if AUTO_MODE else f"hotkey only ({SCAN_HOTKEY.upper()})"
-    print(f"Overlay running, mode: {mode}. Close this window to quit.")
+    print(f"Overlay version {VERSION}, mode: {mode}. Close this window to quit.")
     root.after(100, poll)
     root.mainloop()
 
