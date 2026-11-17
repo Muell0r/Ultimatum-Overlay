@@ -12,6 +12,8 @@ Hover an **Inscribed Ultimatum** in your inventory or stash and see what you wou
 The tool takes a screenshot around your mouse cursor and reads the tooltip text with OCR. It does not touch the game.
 
 > \*\*Disclaimer:\*\* This is an unofficial fan-made tool. It is not affiliated with, endorsed by or supported by Grinding Gear Games, poe.ninja, poedb.tw or Anthropic. \*Path of Exile\* is a trademark of Grinding Gear Games. The tool only reads pixels on your screen: it does not read or change game memory, does not inject into the game process and does not send inputs to the game. Grinding Gear Games has not officially approved tools of this kind, so use it at your own risk.
+>
+> For now you can check my Stream [![Twitch](https://img.shields.io/badge/Twitch-Live-9146FF?logo=twitch&logoColor=white)](https://www.twitch.tv/muell0r) to see it in progress. but please note im not a real streamer so dont expect any entertainment but please let me know of any Problems or Questions you have so we can make it work for everybody
 
 ## Requirements
 
