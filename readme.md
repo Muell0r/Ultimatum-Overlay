@@ -2,6 +2,9 @@
 
 Hover an **Inscribed Ultimatum** in your inventory or stash and see what you would get, without leaving the game:
 
+![Tool 1](tool1.png)
+
+
 * **Divination card rewards:** the card's name, stack size and reward (for Ultimatums that double sacrificed divination cards).
 * **Unique item rewards:** the unique item's picture and name, for example *The Magnate* or *The Immortal Will*.
 * **Prices:** current prices from poe.ninja. For unique rewards it also compares the price of the sacrificed unique with the reward and shows the difference.
