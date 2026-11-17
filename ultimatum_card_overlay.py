@@ -76,7 +76,7 @@ HEADERS = {
     "Accept-Language": "en",
 }
 BG = "#0d0b09"
-VERSION = "3.1 (with price check)"
+VERSION = "3.2 (with price check)"
 
 # ------------------------------------------------------------------ paths
 def base_dir():
@@ -333,7 +333,7 @@ def resolve_league():
 
 
 def exchange_prices(league, typ):
-    """Returns ({item name: price in the primary currency}, core)."""
+    """Returns ({item name or id: price in the primary currency}, core, raw answer)."""
     data = ninja_get("/poe1/api/economy/exchange/current/overview", league=league, type=typ)
     core = data.get("core") or {}
     items = core.get("items")
@@ -343,18 +343,17 @@ def exchange_prices(league, typ):
     names = {}
     for it in items or []:
         if isinstance(it, dict) and it.get("name"):
-            for key in ("id", "detailsId"):
-                if it.get(key) is not None:
-                    names[str(it[key])] = it["name"]
+            for val in it.values():                      # any field may be what a line points to
+                if isinstance(val, (str, int)) and not isinstance(val, bool):
+                    names.setdefault(str(val), it["name"])
     out = {}
     for line in data.get("lines") or []:
-        nm = names.get(str(line.get("id")))
-        if nm and line.get("primaryValue") is not None:
-            out[nm] = float(line["primaryValue"])
-    if not out:
-        print(f"[info] no prices found for {typ}. Start of the answer:")
-        print("       " + json.dumps(data)[:600])
-    return out, core
+        if line.get("primaryValue") is None or line.get("id") is None:
+            continue
+        # if no name is known, the id itself is kept (it is usually a slug of the name)
+        nm = names.get(str(line["id"])) or str(line["id"])
+        out[nm] = float(line["primaryValue"])
+    return out, core, data
 
 
 def stash_unique_prices(league):
@@ -382,15 +381,38 @@ def stash_unique_prices(league):
 def refresh_prices():
     print(f"[info] loading prices from poe.ninja (league setting: {LEAGUE}) ...")
     league = resolve_league()
-    cur, core = exchange_prices(league, "Currency")
+    cur, core, _ = exchange_prices(league, "Currency")
     primary = json.dumps(core.get("primary")).lower()
-    chaos_v = cur.get("Chaos Orb") or (1.0 if "chaos" in primary else None)
-    divine_v = cur.get("Divine Orb") or (1.0 if "divine" in primary else None)
-    cards_raw, _ = exchange_prices(league, "DivinationCard")
+    chaos_v = cur.get("Chaos Orb") or cur.get("chaos") or (1.0 if "chaos" in primary else None)
+    divine_v = cur.get("Divine Orb") or cur.get("divine") or (1.0 if "divine" in primary else None)
+    cards_raw, _, raw_cards = exchange_prices(league, "DivinationCard")
     new_cards = {}
     for name, v in cards_raw.items():
         new_cards[name] = {"c": v / chaos_v if chaos_v else None,
                            "d": v / divine_v if divine_v else None, "raw": v}
+    known = {norm_key(n) for n in cards}
+    matched = sum(1 for n in new_cards if norm_key(n) in known)
+    print(f"[info] card prices: {len(new_cards)} entries, {matched} match the {len(known)} known cards")
+    if known and matched < 0.5 * len(known):
+        # fallback: the stash overview also lists cards with chaos/divine values
+        try:
+            data = ninja_get("/poe1/api/economy/stash/current/item/overview",
+                             league=league, type="DivinationCard")
+            for line in data.get("lines") or []:
+                if line.get("name") and line.get("chaosValue") is not None:
+                    new_cards[line["name"]] = {"c": line.get("chaosValue"),
+                                               "d": line.get("divineValue"), "raw": None}
+            matched = sum(1 for n in new_cards if norm_key(n) in known)
+            print(f"[info] after fallback: {matched} of {len(known)} cards have a price")
+        except Exception as e:
+            print(f"[info] fallback for card prices failed: {e}")
+        if matched < 0.5 * len(known):
+            lines = raw_cards.get("lines") or []
+            items = (raw_cards.get("core") or {}).get("items")
+            print("[debug] first price line :", json.dumps(lines[:1])[:400])
+            print("[debug] core.primary     :", json.dumps((raw_cards.get("core") or {}).get("primary"))[:200])
+            print("[debug] core.items sample:", json.dumps(
+                (items[:1] if isinstance(items, list) else list((items or {}).items())[:1]))[:400])
     new_uniques = stash_unique_prices(league)
     if not new_cards and not new_uniques:
         raise RuntimeError("poe.ninja returned no prices")
